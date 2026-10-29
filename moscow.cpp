@@ -240,6 +240,7 @@ static void update(float dt) {
     speed += accel * dt;
     if (speed < 0.0f)        speed = 0.0f;
     if (speed > SPEED_MAX)   speed = SPEED_MAX;
+    distance += speed * dt;
     
     // Руль
     float targetVX = 0.0f;
@@ -377,6 +378,11 @@ static void setupPerspective() {
 }
 
 static void render3D() {
+    static int frame2 = 0;
+    frame2++;
+    if (frame2 % 30 == 0) {
+        fprintf(stderr, "DBG render: dist=%.2f speed=%.2f\n", distance, speed);
+    }
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
@@ -432,7 +438,7 @@ static void render3D() {
     float lanesX[2] = { 3.75f, 7.25f };
     glDisable(GL_LIGHTING);
     glColor3f(0.92f, 0.92f, 0.92f);
-    for (float zBase = -500.0f - scroll; zBase < 60.0f; zBase += dashPeriod) {
+    for (float zBase = -500.0f + scroll; zBase < 60.0f; zBase += dashPeriod) { // разметка теперь не едет вместе с машиной
         for (int i = 0; i < 2; ++i) {
             float x = lanesX[i];
             glBegin(GL_QUADS);
@@ -452,17 +458,26 @@ static void render3D() {
     }
     glEnable(GL_LIGHTING);
 
-    // Осевой отбойник
-    drawBox(0, 0.55f, -350, 0.28f, 0.55f, 450.0f, 0.80f, 0.80f, 0.82f);
-    drawBox(0, 1.15f, -350, 0.12f, 0.10f, 450.0f, 0.60f, 0.60f, 0.62f);
-    // Боковые отбойники
-    drawBox( 10.7f, 0.55f, -350, 0.20f, 0.55f, 450.0f, 0.80f, 0.80f, 0.82f);
-    drawBox(-10.7f, 0.55f, -350, 0.20f, 0.55f, 450.0f, 0.80f, 0.80f, 0.82f);
+    // Осевой и боковые отбойники — сегментами
+    {
+        float railPeriod = 6.0f;
+        float railHalf   = 2.75f;
+        float phase = fmodf(distance, railPeriod);
 
+        for (int k = 0; k < 100; ++k) {
+            float z = -500.0f + phase + k * railPeriod;
+            if (z > 60.0f) break;
+
+            drawBox(0, 0.55f, z, 0.28f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
+            drawBox(0, 1.15f, z, 0.12f, 0.10f, railHalf, 0.60f,0.60f,0.62f);
+            drawBox( 10.7f, 0.55f, z, 0.20f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
+            drawBox(-10.7f, 0.55f, z, 0.20f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
+        }
+    }
     // Фонари вдоль дороги
     float lightPeriod = 45.0f;
     float lscroll = fmodf(distance, lightPeriod);
-    for (float z = -500.0f - lscroll; z < 60.0f; z += lightPeriod) {
+    for (float z = -500.0f + lscroll; z < 60.0f; z += lightPeriod) { // столбы уже не едут паралельно с машиной игрока
         for (int s = -1; s <= 1; s += 2) {
             float px = s * 11.4f;
             float armX = s * 8.5f;
@@ -472,9 +487,31 @@ static void render3D() {
             drawBox(armX, 7.85f, z, 0.5f, 0.15f, 0.3f, 1.0f, 0.95f, 0.70f);
         }
     }
-
+    // Кусты — частые реперы на обочине
+    {
+        float bushPeriod = 18.0f;
+        float phase = fmodf(distance, bushPeriod);
+        for (int k = 0; k < 35; ++k) {
+            float z = -500.0f + phase + k * bushPeriod;
+            if (z > 60.0f) break;
+            for (int s = -1; s <= 1; s += 2) {
+                float px = s * (13.0f + (k % 3) * 1.5f);
+                drawBox(px, 0.8f, z, 1.2f, 0.8f, 1.2f, 0.20f, 0.40f, 0.20f);
+            }
+        }
+    }
     // Здания
     for (auto& b : buildings) drawBuilding(b);
+    // Трава по бокам — репер
+    glDisable(GL_LIGHTING);
+    glColor3f(0.30f, 0.45f, 0.25f);
+    glBegin(GL_QUADS);
+    glVertex3f(-200, -0.06f, -800); glVertex3f(-11.0f, -0.06f, -800);
+    glVertex3f(-11.0f, -0.06f,  100); glVertex3f(-200, -0.06f,  100);
+    glVertex3f( 11.0f, -0.06f, -800); glVertex3f( 200, -0.06f, -800);
+    glVertex3f( 200, -0.06f,  100); glVertex3f( 11.0f, -0.06f,  100);
+    glEnd();
+    glEnable(GL_LIGHTING);
 
     // Попутные и встречные машины
     for (auto& c : cars) drawCar(c.x, c.z, c.r, c.g, c.b, false, c.oncoming);
@@ -486,6 +523,11 @@ static void render3D() {
 }
 
 static void renderHUD() {
+    static int frame = 0;
+    frame++;
+    if (frame % 30 == 0) {
+        fprintf(stderr, "DBG update: dist=%.2f speed=%.2f\n", distance, speed);
+    }
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, WIN_W, WIN_H, 0, -1, 1);
