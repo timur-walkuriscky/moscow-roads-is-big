@@ -1,11 +1,8 @@
-// Москва: шашки по трассе — X11 + OpenGL 1.x
-// Сборка: g++ moscow.cpp -o moscow -lX11 -lGL -lm -std=c++17 -O2
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <X11/XKBlib.h>
+// Москва: шашки по трассе — GLFW + OpenGL 1.x (кроссплатформенно)
+// Linux:   g++ moscow.cpp -o moscow -lglfw -lGL -lm -std=c++17 -O2
+// Windows: x86_64-w64-mingw32-g++ moscow.cpp -o moscow.exe -lglfw3 -lopengl32 -lgdi32 -luser32 -std=c++17 -O2
+#include <GLFW/glfw3.h>
 #include <GL/gl.h>
-#include <GL/glx.h>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -19,23 +16,18 @@ static const int   WIN_W   = 1280;
 static const int   WIN_H   = 720;
 static const float PI      = 3.14159265f;
 static const float LANE_W  = 3.5f;
-// полосы игрока (правая сторона): x = 2.0, 5.5, 9.0
 static const float PLAYER_LANES[3] = { 2.0f, 5.5f, 9.0f };
 static const float PLAYER_MIN_X    = 1.3f;
 static const float PLAYER_MAX_X    = 9.7f;
-// Реальная модель: газ даёт тягу, воздух и качение тормозят
-static const float ENGINE_ACCEL = 30.0f;    // м/с² при полном газе
-static const float BRAKE_ACCEL  = 60.0f;    // м/с² при тормозе
-static const float DRAG_K       = 0.0018f;  // аэродинамика: F = K * v²
-static const float ROLL_K       = 0.60f;    // трение качения (постоянное)
-static const float SPEED_MAX    = 135.0f;   // аппаратный потолок ~486 км/ч
+static const float ENGINE_ACCEL = 30.0f;
+static const float BRAKE_ACCEL  = 60.0f;
+static const float DRAG_K       = 0.0018f;
+static const float ROLL_K       = 0.60f;
+static const float SPEED_MAX    = 135.0f;
 
-// ---------- X11/GL ----------
-static Display*   dpy = nullptr;
-static Window     win;
-static GLXContext glctx;
-static Atom       wmDelete;
-static std::set<int> keysDown;
+// ---------- Окно и ввод (GLFW) ----------
+static GLFWwindow*   window = nullptr;
+static std::set<int> keysDown;  // GLFW_KEY_* пока клавиша зажата
 
 // ---------- Вспомогательное ----------
 static float frand(float lo, float hi) {
@@ -93,7 +85,8 @@ static void drawBox(float cx, float cy, float cz,
     glVertex3f(cx-hx, cy-hy, cz-hz); glVertex3f(cx+hx, cy-hy, cz-hz);
     glVertex3f(cx+hx, cy-hy, cz+hz); glVertex3f(cx-hx, cy-hy, cz+hz);
     glEnd();
-    }
+}
+
 // ---------- 2D-текст ----------
 static void drawChar(char c, float x, float y, float s) {
     if (c < 32 || c > 90) c = '?';
@@ -130,14 +123,14 @@ static int   carsPassed = 0;
 
 struct Car {
     float x, z;
-    float vabs;      // абсолютная скорость
-    bool  oncoming;  // встречка?
+    float vabs;
+    bool  oncoming;
     float r, g, b;
 };
 struct Building {
     float x, z;
     float w, h, d;
-    int   type;      // 0=панелька 1=сталинка 2=Сити 3=Останкино 4=офис
+    int   type;
 };
 
 static std::vector<Car>      cars;
@@ -145,7 +138,7 @@ static std::vector<Building> buildings;
 static float carSpawnTimer = 0.0f;
 
 // ---------- Создание объектов ----------
-static const float ROAD_INNER = 15.0f;  // от центра дороги до ближайшей стены
+static const float ROAD_INNER = 15.0f;
 
 static Building makeBuilding(float z) {
     Building b;
@@ -154,7 +147,6 @@ static Building makeBuilding(float z) {
     int  type = std::rand() % 5;
     float sideX = left ? -1.0f : 1.0f;
 
-    // сначала размеры — потом позиция
     switch (type) {
         case 0: b.w = frand(40, 80); b.h = frand(15, 25); b.d = frand(12, 20); break;
         case 1: b.w = frand(20, 28); b.h = frand(70, 95); b.d = frand(20, 28); break;
@@ -163,8 +155,6 @@ static Building makeBuilding(float z) {
         default:b.w = frand(20, 40); b.h = frand(30, 60); b.d = frand(20, 40); break;
     }
 
-    // x ставим так, чтобы *внутренняя стена* была за ROAD_INNER,
-    // плюс случайный "отступ назад" для разнообразия рядов
     float back = frand(2.0f, 30.0f);
     b.x = sideX * (ROAD_INNER + b.w * 0.5f + back);
     b.type = type;
@@ -203,7 +193,6 @@ static void resetGame() {
     shake = 0.0f; timeAlive = 0.0f; carsPassed = 0;
     cars.clear(); buildings.clear();
     carSpawnTimer = 0.3f;
-    // прогрев зданий
     float z = -180.0f;
     while (z > -900.0f) {
         buildings.push_back(makeBuilding(z));
@@ -214,56 +203,43 @@ static void resetGame() {
 // ---------- Обновление ----------
 static void update(float dt) {
     if (gameOver) {
-        if (keysDown.count(XK_r)) resetGame();
+        if (keysDown.count(GLFW_KEY_R)) resetGame();
         shake *= expf(-3.0f * dt);
         return;
     }
     timeAlive += dt;
 
-    // Скорость
-    // --- Реальная физика скорости ---
+    // --- Физика скорости ---
     float accel = 0.0f;
-
-    // Газ
-    if (keysDown.count(XK_w) || keysDown.count(XK_Up))
+    if (keysDown.count(GLFW_KEY_W) || keysDown.count(GLFW_KEY_UP))
         accel += ENGINE_ACCEL;
-
-    // Тормоз
-    if (keysDown.count(XK_s) || keysDown.count(XK_Down))
+    if (keysDown.count(GLFW_KEY_S) || keysDown.count(GLFW_KEY_DOWN))
         accel -= BRAKE_ACCEL;
 
-    // Сопротивление: воздух (v²) + качение (константа)
     float drag = DRAG_K * speed * speed + ROLL_K;
     accel -= drag;
 
-    // Интегрирование
     speed += accel * dt;
-    if (speed < 0.0f)        speed = 0.0f;
-    if (speed > SPEED_MAX)   speed = SPEED_MAX;
+    if (speed < 0.0f)      speed = 0.0f;
+    if (speed > SPEED_MAX) speed = SPEED_MAX;
     distance += speed * dt;
-    
-    // Руль
+
+    // --- Руль ---
     float targetVX = 0.0f;
-    if (keysDown.count(XK_a) || keysDown.count(XK_Left))  targetVX -= 9.5f;
-    if (keysDown.count(XK_d) || keysDown.count(XK_Right)) targetVX += 9.5f;
+    if (keysDown.count(GLFW_KEY_A) || keysDown.count(GLFW_KEY_LEFT))  targetVX -= 9.5f;
+    if (keysDown.count(GLFW_KEY_D) || keysDown.count(GLFW_KEY_RIGHT)) targetVX += 9.5f;
     playerVX += (targetVX - playerVX) * (1.0f - expf(-7.0f * dt));
     playerX  += playerVX * dt;
     playerX   = clampf(playerX, PLAYER_MIN_X, PLAYER_MAX_X);
 
     // --- Машины потока ---
     for (auto& c : cars) {
-        // Попутные: если vabs > speed — уезжают вперёд (z уменьшается)
-        //           если speed > vabs — ты их догоняешь (z растёт)
-        // Встречные: всегда летят навстречу (z += speed + vabs)
         float rel = c.oncoming ? (speed + c.vabs) : (speed - c.vabs);
         c.z += rel * dt;
     }
-    // Убрать уехавших
-    // Удаляем тех, кто уехал далеко вперёд (z ушёл за -400)
-    // и тех, кто уже проехал позади камеры (z > 12)
     cars.erase(std::remove_if(cars.begin(), cars.end(),
         [](const Car& c){ return c.z > 12.0f || c.z < -400.0f; }), cars.end());
-    // Спавн
+
     carSpawnTimer -= dt;
     if (carSpawnTimer <= 0.0f) {
         carSpawnTimer = frand(0.35f, 1.10f);
@@ -276,7 +252,6 @@ static void update(float dt) {
     buildings.erase(std::remove_if(buildings.begin(), buildings.end(),
         [](const Building& b){ return b.z > 80.0f; }), buildings.end());
 
-    // Спавн новых зданий впереди, пока их мало
     float minZ = 0.0f;
     for (auto& b : buildings) if (b.z < minZ) minZ = b.z;
     while (minZ > -900.0f) {
@@ -284,13 +259,13 @@ static void update(float dt) {
         buildings.push_back(makeBuilding(minZ));
     }
 
-    // --- Столкновения (только с попутными) ---
+    // --- Столкновения ---
     for (auto& c : cars) {
         if (c.oncoming) continue;
         if (fabsf(c.x - playerX) < 2.0f && fabsf(c.z) < 4.2f) {
             lives--;
             shake = 1.2f;
-            c.z = 100.0f;   // убрать
+            c.z = 100.0f;
             if (lives <= 0) {
                 gameOver = true;
                 if (distance > bestDist) bestDist = distance;
@@ -298,7 +273,6 @@ static void update(float dt) {
         }
     }
 
-    // --- Тряска ---
     shake *= expf(-3.0f * dt);
     shake += speed * 0.0004f * dt;
 }
@@ -307,20 +281,17 @@ static void update(float dt) {
 static void drawCar(float x, float z, float r, float g, float b,
                     bool player, bool oncoming) {
     float W = 1.9f, H = 1.35f, D = 4.4f;
+    (void)H;
 
-    // Низ (колёса)
     float wy = 0.28f;
     drawBox(x - W/2, wy, z - D*0.30f, 0.15f, 0.28f, 0.30f, 0.05f,0.05f,0.05f);
     drawBox(x + W/2, wy, z - D*0.30f, 0.15f, 0.28f, 0.30f, 0.05f,0.05f,0.05f);
     drawBox(x - W/2, wy, z + D*0.30f, 0.15f, 0.28f, 0.30f, 0.05f,0.05f,0.05f);
     drawBox(x + W/2, wy, z + D*0.30f, 0.15f, 0.28f, 0.30f, 0.05f,0.05f,0.05f);
 
-    // Кузов
     drawBox(x, 0.55f, z, W/2, 0.30f, D/2, r, g, b);
-    // Крыша / стёкла
     drawBox(x, 1.02f, z, W*0.42f, 0.30f, D*0.28f, 0.10f, 0.12f, 0.18f);
 
-    // Фары / габариты
     float frontZ = (player || !oncoming) ? (z - D/2 + 0.05f) : (z + D/2 - 0.05f);
     float backZ  = (player || !oncoming) ? (z + D/2 - 0.05f) : (z - D/2 + 0.05f);
     drawBox(x - 0.55f, 0.55f, frontZ, 0.20f, 0.13f, 0.05f, 1.0f, 0.95f, 0.75f);
@@ -332,32 +303,32 @@ static void drawCar(float x, float z, float r, float g, float b,
 // ---------- Отрисовка здания ----------
 static void drawBuilding(const Building& b) {
     switch (b.type) {
-    case 0: // панелька
+    case 0:
         drawBox(b.x, b.h/2, b.z, b.w/2, b.h/2, b.d/2, 0.86f, 0.84f, 0.78f);
         drawBox(b.x, b.h*0.55f, b.z, b.w/2 + 0.02f, b.h*0.18f, b.d/2 + 0.02f,
                 0.32f, 0.40f, 0.52f);
         drawBox(b.x, b.h*0.18f, b.z, b.w/2 + 0.02f, b.h*0.10f, b.d/2 + 0.02f,
                 0.32f, 0.40f, 0.52f);
         break;
-    case 1: // сталинка
+    case 1:
         drawBox(b.x, b.h*0.40f, b.z, b.w/2,       b.h*0.40f, b.d/2,       0.78f,0.71f,0.62f);
         drawBox(b.x, b.h*0.82f, b.z, b.w*0.32f/2, b.h*0.10f, b.d*0.32f/2, 0.78f,0.71f,0.62f);
         drawBox(b.x, b.h*0.97f, b.z, b.w*0.15f/2, b.h*0.06f, b.d*0.15f/2,0.78f,0.71f,0.62f);
         drawBox(b.x, b.h*1.06f, b.z, 0.4f,         b.h*0.05f, 0.4f,       0.75f,0.10f,0.10f);
         break;
-    case 2: // Москва-Сити
+    case 2:
         drawBox(b.x, b.h*0.45f, b.z, b.w/2,         b.h*0.45f, b.d/2,       0.55f,0.68f,0.85f);
         drawBox(b.x, b.h*0.85f, b.z, b.w*0.42f/2,   b.h*0.15f, b.d*0.42f/2, 0.70f,0.82f,0.95f);
         drawBox(b.x, b.h*1.00f, b.z, b.w*0.10f/2,   b.h*0.05f, b.d*0.10f/2, 0.85f,0.92f,1.00f);
         break;
-    case 3: // Останкино
+    case 3:
         drawBox(b.x, b.h*0.30f, b.z, 3.0f,        b.h*0.30f, 3.0f,        0.72f,0.72f,0.76f);
         drawBox(b.x, b.h*0.60f, b.z, 1.6f,        b.h*0.30f, 1.6f,        0.72f,0.72f,0.76f);
         drawBox(b.x, b.h*0.82f, b.z, 1.0f,        b.h*0.22f, 1.0f,        0.72f,0.72f,0.76f);
         drawBox(b.x, b.h*0.66f, b.z, 8.0f,        3.5f,      8.0f,        0.62f,0.62f,0.68f);
         drawBox(b.x, b.h*0.99f, b.z, 0.6f,        5.0f,      0.6f,        0.95f,0.25f,0.20f);
         break;
-    default: // офис
+    default:
         drawBox(b.x, b.h/2, b.z, b.w/2, b.h/2, b.d/2, 0.52f, 0.58f, 0.66f);
         drawBox(b.x, b.h*0.90f, b.z, b.w/2+0.02f, b.h*0.04f, b.d/2+0.02f,
                 0.92f, 0.82f, 0.42f);
@@ -378,11 +349,6 @@ static void setupPerspective() {
 }
 
 static void render3D() {
-    static int frame2 = 0;
-    frame2++;
-    if (frame2 % 30 == 0) {
-        fprintf(stderr, "DBG render: dist=%.2f speed=%.2f\n", distance, speed);
-    }
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
@@ -390,7 +356,6 @@ static void render3D() {
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glShadeModel(GL_SMOOTH);
 
-    // Туман в цвет неба
     GLfloat fogC[4] = { 0.72f, 0.80f, 0.92f, 1.0f };
     glFogfv(GL_FOG_COLOR, fogC);
     glFogi(GL_FOG_MODE, GL_LINEAR);
@@ -400,7 +365,6 @@ static void render3D() {
 
     glClearColor(fogC[0], fogC[1], fogC[2], 1.0f);
 
-    // Камера от третьего лица
     float camY = 4.6f + cosf(timeAlive * 27.0f) * shake * 0.15f;
     float camZ = 8.5f;
     float camX = playerX + sinf(timeAlive * 31.0f) * shake * 0.12f;
@@ -411,7 +375,6 @@ static void render3D() {
     glRotatef(pitch, 1, 0, 0);
     glTranslatef(-camX, -camY, -camZ);
 
-    // Источник света (небо)
     GLfloat lpos[] = { 0.3f, 1.0f, 0.2f, 0.0f };
     GLfloat lamb[] = { 0.55f, 0.55f, 0.58f, 1.0f };
     GLfloat ldif[] = { 0.85f, 0.85f, 0.85f, 1.0f };
@@ -419,7 +382,6 @@ static void render3D() {
     glLightfv(GL_LIGHT0, GL_AMBIENT,  lamb);
     glLightfv(GL_LIGHT0, GL_DIFFUSE,  ldif);
 
-    // Земля
     glDisable(GL_COLOR_MATERIAL);
     glColor3f(0.35f, 0.42f, 0.30f);
     glBegin(GL_QUADS);
@@ -429,16 +391,15 @@ static void render3D() {
     glEnd();
     glEnable(GL_COLOR_MATERIAL);
 
-    // Асфальт (вся трасса)
     drawBox(0, -0.05f, -350, 10.5f, 0.05f, 450.0f, 0.24f, 0.24f, 0.26f);
 
-    // Разметка: прерывистая, скроллится по distance
+    // Разметка
     float dashPeriod = 12.0f, dashLen = 6.0f;
     float scroll = fmodf(distance, dashPeriod);
     float lanesX[2] = { 3.75f, 7.25f };
     glDisable(GL_LIGHTING);
     glColor3f(0.92f, 0.92f, 0.92f);
-    for (float zBase = -500.0f + scroll; zBase < 60.0f; zBase += dashPeriod) { // разметка теперь не едет вместе с машиной
+    for (float zBase = -500.0f + scroll; zBase < 60.0f; zBase += dashPeriod) {
         for (int i = 0; i < 2; ++i) {
             float x = lanesX[i];
             glBegin(GL_QUADS);
@@ -448,7 +409,6 @@ static void render3D() {
             glVertex3f(x-0.08f, 0.02f, zBase+dashLen);
             glEnd();
         }
-        // сплошные с двух сторон
         glBegin(GL_QUADS);
         glVertex3f( 1.15f, 0.02f, zBase); glVertex3f( 1.30f, 0.02f, zBase);
         glVertex3f( 1.30f, 0.02f, zBase+dashPeriod); glVertex3f( 1.15f, 0.02f, zBase+dashPeriod);
@@ -458,26 +418,25 @@ static void render3D() {
     }
     glEnable(GL_LIGHTING);
 
-    // Осевой и боковые отбойники — сегментами
+    // Отбойники сегментами
     {
         float railPeriod = 6.0f;
         float railHalf   = 2.75f;
         float phase = fmodf(distance, railPeriod);
-
         for (int k = 0; k < 100; ++k) {
             float z = -500.0f + phase + k * railPeriod;
             if (z > 60.0f) break;
-
             drawBox(0, 0.55f, z, 0.28f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
             drawBox(0, 1.15f, z, 0.12f, 0.10f, railHalf, 0.60f,0.60f,0.62f);
             drawBox( 10.7f, 0.55f, z, 0.20f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
             drawBox(-10.7f, 0.55f, z, 0.20f, 0.55f, railHalf, 0.80f,0.80f,0.82f);
         }
     }
-    // Фонари вдоль дороги
+
+    // Фонари
     float lightPeriod = 45.0f;
     float lscroll = fmodf(distance, lightPeriod);
-    for (float z = -500.0f + lscroll; z < 60.0f; z += lightPeriod) { // столбы уже не едут паралельно с машиной игрока
+    for (float z = -500.0f + lscroll; z < 60.0f; z += lightPeriod) {
         for (int s = -1; s <= 1; s += 2) {
             float px = s * 11.4f;
             float armX = s * 8.5f;
@@ -487,7 +446,8 @@ static void render3D() {
             drawBox(armX, 7.85f, z, 0.5f, 0.15f, 0.3f, 1.0f, 0.95f, 0.70f);
         }
     }
-    // Кусты — частые реперы на обочине
+
+    // Кусты
     {
         float bushPeriod = 18.0f;
         float phase = fmodf(distance, bushPeriod);
@@ -500,9 +460,11 @@ static void render3D() {
             }
         }
     }
+
     // Здания
     for (auto& b : buildings) drawBuilding(b);
-    // Трава по бокам — репер
+
+    // Трава по бокам
     glDisable(GL_LIGHTING);
     glColor3f(0.30f, 0.45f, 0.25f);
     glBegin(GL_QUADS);
@@ -513,21 +475,13 @@ static void render3D() {
     glEnd();
     glEnable(GL_LIGHTING);
 
-    // Попутные и встречные машины
     for (auto& c : cars) drawCar(c.x, c.z, c.r, c.g, c.b, false, c.oncoming);
-
-    // Игрок
     drawCar(playerX, 0.0f, 0.95f, 0.30f, 0.05f, true, false);
 
     glDisable(GL_FOG);
 }
 
 static void renderHUD() {
-    static int frame = 0;
-    frame++;
-    if (frame % 30 == 0) {
-        fprintf(stderr, "DBG update: dist=%.2f speed=%.2f\n", distance, speed);
-    }
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, WIN_W, WIN_H, 0, -1, 1);
@@ -538,37 +492,30 @@ static void renderHUD() {
 
     char buf[96];
 
-    // Скорость в км/ч
     int kmh = (int)(speed * 3.6f);
     glColor3f(1, 1, 1);
     snprintf(buf, sizeof(buf), "SPEED: %d KM/H", kmh);
     drawText(buf, 20, 20, 3.0f);
 
-    // Пройдено метров
     glColor3f(0.95f, 0.95f, 0.95f);
     snprintf(buf, sizeof(buf), "DIST:  %d M", (int)distance);
     drawText(buf, 20, 55, 2.0f);
 
-    // Обгонено
     glColor3f(0.85f, 0.95f, 0.85f);
     snprintf(buf, sizeof(buf), "CARS:  %d", carsPassed);
     drawText(buf, 20, 82, 2.0f);
 
-    // Жизни
     glColor3f(0.95f, 0.2f, 0.2f);
     snprintf(buf, sizeof(buf), "LIVES: %d", lives);
     drawText(buf, WIN_W - (int)textWidth(buf, 3.0f) - 20, 20, 3.0f);
 
-    // Лучший результат
     glColor3f(0.85f, 0.85f, 0.85f);
     snprintf(buf, sizeof(buf), "BEST:  %d M", (int)bestDist);
     drawText(buf, WIN_W - (int)textWidth(buf, 2.0f) - 20, 60, 2.0f);
 
-    // Подсказка
     glColor3f(0.15f, 0.15f, 0.15f);
     drawText("WASD/ARROWS - DRIVE", 20, WIN_H - 40, 2.0f);
 
-    // Game Over
     if (gameOver) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -595,74 +542,52 @@ static void renderHUD() {
     }
 }
 
+// ---------- Ввод ----------
+static void key_callback(GLFWwindow* w, int key, int scancode, int action, int mods) {
+    (void)scancode; (void)mods;
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+        glfwSetWindowShouldClose(w, GLFW_TRUE);
+        return;
+    }
+    if (action == GLFW_PRESS)        keysDown.insert(key);
+    else if (action == GLFW_RELEASE) keysDown.erase(key);
+    // GLFW_REPEAT игнорируем — клавиша и так уже в set
+}
+
 // ---------- main ----------
 int main() {
     std::srand((unsigned)std::time(nullptr));
 
-    dpy = XOpenDisplay(nullptr);
-    if (!dpy) { fprintf(stderr, "Нет X display\n"); return 1; }
-    int screen = DefaultScreen(dpy);
+    if (!glfwInit()) {
+        fprintf(stderr, "GLFW init failed\n");
+        return 1;
+    }
 
-    Bool supp;
-    XkbSetDetectableAutoRepeat(dpy, True, &supp);
+    // Просим OpenGL 2.1 — compatibility profile, чтобы glBegin/glEnd работали
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_DEPTH_BITS, 24);
 
-    static int attribs[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_DOUBLEBUFFER, None };
-    XVisualInfo* vi = glXChooseVisual(dpy, screen, attribs);
-    if (!vi) { fprintf(stderr, "Нет GLX visual\n"); return 1; }
+    window = glfwCreateWindow(WIN_W, WIN_H, "Moscow Traffic - Shashki", nullptr, nullptr);
+    if (!window) {
+        fprintf(stderr, "Window creation failed\n");
+        glfwTerminate();
+        return 1;
+    }
 
-    Colormap cmap = XCreateColormap(dpy,
-        RootWindow(dpy, vi->screen), vi->visual, AllocNone);
-
-    XSetWindowAttributes swa = {};
-    swa.colormap   = cmap;
-    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
-                     StructureNotifyMask | FocusChangeMask;
-
-    win = XCreateWindow(dpy, RootWindow(dpy, vi->screen),
-                        0, 0, WIN_W, WIN_H, 0,
-                        vi->depth, InputOutput, vi->visual,
-                        CWColormap | CWEventMask, &swa);
-    XStoreName(dpy, win, "Moscow Traffic - Shashki");
-
-    wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wmDelete, 1);
-    XMapWindow(dpy, win);
-
-    glctx = glXCreateContext(dpy, vi, nullptr, GL_TRUE);
-    glXMakeCurrent(dpy, win, glctx);
-    XFree(vi);
+    glfwMakeContextCurrent(window);
+    glfwSetKeyCallback(window, key_callback);
+    glfwSwapInterval(1);  // vsync
 
     glViewport(0, 0, WIN_W, WIN_H);
     glEnable(GL_DEPTH_TEST);
 
     resetGame();
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    double last = ts.tv_sec + ts.tv_nsec * 1e-9;
+    double last = glfwGetTime();
 
-    bool running = true;
-    while (running) {
-        while (XPending(dpy)) {
-            XEvent ev;
-            XNextEvent(dpy, &ev);
-            switch (ev.type) {
-            case ClientMessage:
-                if ((Atom)ev.xclient.data.l[0] == wmDelete) running = false;
-                break;
-            case KeyPress: {
-                KeySym ks = XLookupKeysym(&ev.xkey, 0);
-                if (ks == XK_Escape) running = false;
-                keysDown.insert(ks);
-            } break;
-            case KeyRelease:
-                keysDown.erase(XLookupKeysym(&ev.xkey, 0));
-                break;
-            }
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    while (!glfwWindowShouldClose(window)) {
+        double now = glfwGetTime();
         float dt = (float)(now - last);
         last = now;
         if (dt > 0.05f) dt = 0.05f;
@@ -674,13 +599,11 @@ int main() {
         render3D();
         renderHUD();
 
-        glXSwapBuffers(dpy, win);
+        glfwSwapBuffers(window);
+        glfwPollEvents();
     }
 
-    glXMakeCurrent(dpy, None, nullptr);
-    glXDestroyContext(dpy, glctx);
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
+    glfwDestroyWindow(window);
+    glfwTerminate();
     return 0;
 }
-
