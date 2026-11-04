@@ -1,13 +1,11 @@
-# Переменные для компилятора и флагов
-CXX = g++
+CXX      = g++
 CXXFLAGS = -std=c++17 -O2
-LIBS = -lX11 -lGL -lm
-TARGET = moscow
+LDLIBS   = -lglfw -lGL -lm
 
-# Команда по умолчанию (просто 'make') скомпилирует бинарник
-all:
-	$(CXX) moscow.cpp -o $(TARGET) $(CXXFLAGS) $(LIBS)
+moscow: moscow.cpp
+	$(CXX) moscow.cpp -o moscow $(CXXFLAGS) $(LDLIBS)
 
-# Команда очистки ('make clean') удалит скомпилированный файл
 clean:
-	rm -f $(TARGET)
+	rm -f moscow
+
+.PHONY: clean
